@@ -2,13 +2,15 @@ name: Polymarket Position Monitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # Runs every 5 minutes
+    - cron: '* * * * *'  # Runs every minute (Note: GitHub Actions may have a delay)
   workflow_dispatch:      # Allows manual trigger
 
 jobs:
   monitor-job:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
@@ -30,3 +32,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TARGET_WALLET: ${{ secrets.TARGET_WALLET }}
         run: python src/bot.py
+
+      - name: Commit and push state
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add last_positions.json
+          # Only commit if there are changes
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update positions state" && git push)
