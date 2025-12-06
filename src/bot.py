@@ -97,6 +97,26 @@ def get_usdc_balance(client):
         print(f"Erro ao verificar saldo: {e}")
         return 0
 
+def get_my_position_size(client, asset_id):
+    """Busca o tamanho da nossa posição para um asset específico"""
+    try:
+        my_address = client.get_address()
+        url = "https://data-api.polymarket.com/positions"
+        params = {'user': my_address}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        positions = response.json()
+        for pos in positions:
+            if pos.get('asset') == asset_id:
+                return float(pos.get('size', 0))
+        return 0
+    except Exception as e:
+        print(f"⚠️ Erro ao buscar posição própria: {e}")
+        return 0
+
 def execute_trade(client, asset_id, side, title, outcome=None):
     """Executa uma ordem de compra/venda"""
     if not client:
@@ -118,37 +138,55 @@ def execute_trade(client, asset_id, side, title, outcome=None):
             print(f"❌ Preço inválido para {title}: {price}")
             return
 
-        # 1.5 Verifica Saldo
-        balance = get_usdc_balance(client)
-        print(f"💰 Saldo Atual: ${balance:.2f} USDC")
-        
-        if balance < FIXED_TRADE_AMOUNT:
-            print(f"⚠️ Saldo insuficiente! Necessário: ${FIXED_TRADE_AMOUNT}, Disponível: ${balance:.2f}")
-            send_telegram_message(f"⚠️ *FALHA NO COPY TRADE*\nSaldo insuficiente.\nNecessário: ${FIXED_TRADE_AMOUNT}\nDisponível: ${balance:.2f}")
-            return
-
-        # 2. Calcula tamanho da ordem (Shares)
-        # Size = Valor Fixo / Preço
-        # Arredondamos para CIMA para garantir que o total seja >= $1.00 (mínimo da Polymarket)
         import math
-        size = FIXED_TRADE_AMOUNT / price
-        size = math.ceil(size * 100) / 100  # Arredonda para cima com 2 casas decimais
+        
+        # 2. Calcula tamanho da ordem (Shares)
+        if side.upper() == "BUY":
+            # COMPRA: Usa valor fixo
+            balance = get_usdc_balance(client)
+            print(f"💰 Saldo Atual: ${balance:.2f} USDC")
+            
+            if balance < FIXED_TRADE_AMOUNT:
+                print(f"⚠️ Saldo insuficiente! Necessário: ${FIXED_TRADE_AMOUNT}, Disponível: ${balance:.2f}")
+                send_telegram_message(f"⚠️ *FALHA NO COPY TRADE*\nSaldo insuficiente.\nNecessário: ${FIXED_TRADE_AMOUNT}\nDisponível: ${balance:.2f}")
+                return
+            
+            # Size = Valor Fixo / Preço
+            # Arredondamos para CIMA para garantir que o total seja >= $1.00 (mínimo da Polymarket)
+            size = FIXED_TRADE_AMOUNT / price
+            size = math.ceil(size * 100) / 100  # Arredonda para cima com 2 casas decimais
+            
+        else:
+            # VENDA: Vende TUDO que temos dessa posição
+            my_size = get_my_position_size(client, asset_id)
+            print(f"📊 Nossa posição atual: {my_size} shares")
+            
+            if my_size <= 0:
+                print(f"⚠️ Não temos posição para vender em '{title}'")
+                return
+            
+            # Arredonda para baixo para não tentar vender mais do que temos
+            size = math.floor(my_size * 100) / 100
         
         if size <= 0:
             print("❌ Tamanho da ordem calculado é 0.")
             return
 
+        # Verifica valor mínimo ($1)
+        total_value = size * price
+        if total_value < 1.0:
+            print(f"⚠️ Valor total muito baixo: ${total_value:.2f} (mínimo $1.00)")
+            return
+
         outcome_str = f" ({outcome})" if outcome else ""
-        print(f"🤖 Preparando Trade: {side} {size} shares de '{title}'{outcome_str} @ {price} (Total: ${size*price:.2f})")
+        action_emoji = "🟢" if side.upper() == "BUY" else "🔴"
+        print(f"{action_emoji} Preparando Trade: {side} {size} shares de '{title}'{outcome_str} @ {price} (Total: ${total_value:.2f})")
         
         if DRY_RUN:
             print("🚧 DRY RUN: Ordem não enviada.")
             return
 
-        # 3. Envia Ordem (FOK - Fill Or Kill para garantir execução imediata ou nada)
-        # Precisamos do Token ID? O asset_id do Data API geralmente é o Token ID.
-        # Data API 'asset' field = Token ID (geralmente um hash longo)
-        
+        # 3. Envia Ordem
         order_args = OrderArgs(
             price=price,
             size=size,
@@ -156,13 +194,11 @@ def execute_trade(client, asset_id, side, title, outcome=None):
             token_id=asset_id
         )
         
-        # Assina e envia
-        # Nota: A versão atual da lib usa GTC por padrão e FOK não parece estar exposto diretamente no OrderArgs simples.
-        # Para FOK, precisaríamos usar opções avançadas ou outra chamada.
-        # Por enquanto, vamos de GTC (Good Till Cancelled) que é o padrão.
         resp = client.create_and_post_order(order_args)
         print(f"✅ Ordem Enviada! ID: {resp.get('orderID')}")
-        send_telegram_message(f"🤖 *COPY TRADE EXECUTADO*\n{side} {size} de {title}\nOutcome: {outcome or 'N/A'}\nPreço: {price}")
+        
+        action_text = "COMPRA" if side.upper() == "BUY" else "VENDA"
+        send_telegram_message(f"🤖 *COPY TRADE - {action_text}*\n{side} {size} de {title}\nOutcome: {outcome or 'N/A'}\nPreço: {price}\nTotal: ${total_value:.2f}")
         
     except PolyApiException as e:
         if e.status_code == 404:
@@ -204,11 +240,16 @@ def get_positions():
         return []
 
 def load_last_positions():
-    """Carrega últimas posições conhecidas (asset -> size)"""
+    """Carrega últimas posições conhecidas (asset -> {size, title, outcome})"""
     try:
         if os.path.exists(POSITIONS_FILE):
             with open(POSITIONS_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                # Migração: Se for formato antigo (apenas size), converte
+                if data and isinstance(list(data.values())[0], (int, float)):
+                    print("📦 Migrando formato antigo de posições...")
+                    return {}  # Reseta para o novo formato
+                return data
         return {}
     except:
         return {}
@@ -244,6 +285,10 @@ def format_position_update(position, change_type, diff_size=0):
             header = "📉 *Redução de Posição*"
             emoji = "➖"
             action_text = f"Vendeu {abs(diff_size):.1f} shares"
+        elif change_type == 'CLOSED':
+            header = "🚪 *Posição Fechada*"
+            emoji = "❌"
+            action_text = f"Vendeu TUDO ({abs(diff_size):.1f} shares)"
         else:
             return None
 
@@ -342,7 +387,8 @@ def main():
             
         else:
             # Posição Existente - Verifica mudança de tamanho
-            last_size = float(last_positions_map.get(asset, 0))
+            last_data = last_positions_map.get(asset, {})
+            last_size = float(last_data.get('size', 0) if isinstance(last_data, dict) else last_data)
             diff = current_size - last_size
             
             # Considera mudança apenas se for significativa (> 0.1 shares para evitar ruído de arredondamento)
@@ -360,25 +406,56 @@ def main():
                 print(f"Redução de posição: {pos.get('title')}")
                 msg = format_position_update(pos, 'DECREASE', diff)
                 if msg: send_telegram_message(msg)
+                
+                # COPY TRADE - SELL (vende proporcionalmente)
+                if clob_client:
+                    execute_trade(clob_client, asset, "SELL", pos.get('title'), pos.get('outcome'))
+                    
                 changes_detected = True
 
     # Verifica Posições Fechadas (Zeradas)
     # Se estava no last_map mas não está no current_map (ou size=0), foi vendida tudo
-    for asset, last_size in last_positions_map.items():
+    for asset, last_data in last_positions_map.items():
         if asset not in current_positions_map:
-            # Posição foi encerrada
-            # Precisamos dos dados antigos para notificar, mas não temos o objeto 'pos' completo aqui facilmente
-            # a menos que tenhamos salvo tudo. Por simplificação, vamos ignorar ou tentar reconstruir.
-            # Se quisermos alertar venda total, precisaríamos ter salvo os metadados antes.
-            # Por enquanto, vamos focar em Novas/Mudanças de posições ativas.
-            pass
+            # Posição foi encerrada - Reconstruir objeto pos para notificação
+            last_size = last_data.get('size', 0) if isinstance(last_data, dict) else last_data
+            last_title = last_data.get('title', 'Unknown') if isinstance(last_data, dict) else 'Unknown'
+            last_outcome = last_data.get('outcome', 'Unknown') if isinstance(last_data, dict) else 'Unknown'
+            
+            print(f"🚪 Posição FECHADA: {last_title} ({last_outcome})")
+            
+            # Cria objeto fake para formatação
+            closed_pos = {
+                'title': last_title,
+                'outcome': last_outcome,
+                'size': 0,
+                'avgPrice': 0,
+                'currentValue': 0,
+                'percentPnl': 0
+            }
+            msg = format_position_update(closed_pos, 'CLOSED', -last_size)
+            if msg: send_telegram_message(msg)
+            
+            # COPY TRADE - SELL ALL (vende tudo que temos)
+            if clob_client:
+                print(f"🔴 Executando venda total de: {last_title}")
+                execute_trade(clob_client, asset, "SELL", last_title, last_outcome)
+                
+            changes_detected = True
 
     if not changes_detected:
         print("Nenhuma mudança nas posições.")
 
     # 4. Salva novo estado
-    # Salva {asset: size} para a próxima comparação
-    new_state = {k: float(v.get('size', 0)) for k, v in current_positions_map.items()}
+    # Salva {asset: {size, title, outcome}} para a próxima comparação (necessário para detectar fechamentos)
+    new_state = {
+        k: {
+            'size': float(v.get('size', 0)),
+            'title': v.get('title', 'Unknown'),
+            'outcome': v.get('outcome', 'Unknown')
+        } 
+        for k, v in current_positions_map.items()
+    }
     save_last_positions(new_state)
     print("Monitoramento concluído")
 
