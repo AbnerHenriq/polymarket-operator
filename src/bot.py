@@ -1,8 +1,15 @@
 import os
 import json
 import requests
+import time
 from datetime import datetime
 from dotenv import load_dotenv
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs
+from py_clob_client.constants import POLYGON
+from py_clob_client.exceptions import PolyApiException
+
+from web3 import Web3
 
 # Load environment variables
 load_dotenv()
@@ -11,6 +18,162 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TARGET_WALLET = os.getenv("TARGET_WALLET")
+
+# Trading Config
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+MAX_TRADE_AMOUNT = float(os.getenv("MAX_TRADE_AMOUNT", "10"))
+FIXED_TRADE_AMOUNT = float(os.getenv("FIXED_TRADE_AMOUNT", "1"))
+DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
+
+# USDC Config (Polygon)
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function"
+    }
+]
+
+def init_clob_client():
+    """Inicializa o cliente CLOB para trading"""
+    if not PRIVATE_KEY:
+        print("⚠️ PRIVATE_KEY não configurada. Modo apenas monitoramento.")
+        return None
+    
+    try:
+        # Deriva endereço da chave privada para garantir
+        w3 = Web3()
+        account = w3.eth.account.from_key(PRIVATE_KEY)
+        my_address = account.address
+        print(f"🔑 Inicializando para carteira: {my_address}")
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=PRIVATE_KEY,
+            chain_id=137, # Polygon Mainnet
+            signature_type=0, # EOA (MetaMask, chave privada direta)
+            funder=my_address # Explicitamente define o funder
+        )
+        # Tenta derivar credenciais (necessário para alguns endpoints)
+        try:
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds)
+            print("🔑 Credenciais de API derivadas e configuradas.")
+            
+            # Verifica se está funcionando
+            client.get_api_keys()
+            print("✅ Autenticação verificada com sucesso.")
+            
+        except Exception as e:
+            print(f"❌ ERRO CRÍTICO: Falha ao configurar credenciais de API: {e}")
+            return None
+            
+        return client
+    except Exception as e:
+        print(f"Erro ao inicializar ClobClient: {e}")
+        return None
+
+def get_usdc_balance(client):
+    """Verifica saldo de USDC na carteira"""
+    try:
+        w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL))
+        if not w3.is_connected():
+            print("⚠️ Não foi possível conectar ao RPC Polygon.")
+            return 0
+            
+        my_address = client.get_address()
+        contract = w3.eth.contract(address=USDC_ADDRESS, abi=USDC_ABI)
+        
+        # Balance vem em Wei (6 decimais para USDC)
+        balance_wei = contract.functions.balanceOf(my_address).call()
+        balance_usdc = balance_wei / 1_000_000 # USDC tem 6 casas decimais
+        
+        return balance_usdc
+    except Exception as e:
+        print(f"Erro ao verificar saldo: {e}")
+        return 0
+
+def execute_trade(client, asset_id, side, title, outcome=None):
+    """Executa uma ordem de compra/venda"""
+    if not client:
+        return
+        
+    try:
+        # 1. Busca Orderbook para pegar preço atual
+        # O lado oposto: Se quero COMPRAR (BUY), olho o preço de VENDA (ASK)
+        book_side = "sell" if side == "BUY" else "buy"
+        orderbook = client.get_order_book(asset_id)
+        
+        price = 0
+        if book_side == "sell" and orderbook.asks:
+            price = float(orderbook.asks[0].price) # Melhor preço de venda
+        elif book_side == "buy" and orderbook.bids:
+            price = float(orderbook.bids[0].price) # Melhor preço de compra
+            
+        if price <= 0:
+            print(f"❌ Preço inválido para {title}: {price}")
+            return
+
+        # 1.5 Verifica Saldo
+        balance = get_usdc_balance(client)
+        print(f"💰 Saldo Atual: ${balance:.2f} USDC")
+        
+        if balance < FIXED_TRADE_AMOUNT:
+            print(f"⚠️ Saldo insuficiente! Necessário: ${FIXED_TRADE_AMOUNT}, Disponível: ${balance:.2f}")
+            send_telegram_message(f"⚠️ *FALHA NO COPY TRADE*\nSaldo insuficiente.\nNecessário: ${FIXED_TRADE_AMOUNT}\nDisponível: ${balance:.2f}")
+            return
+
+        # 2. Calcula tamanho da ordem (Shares)
+        # Size = Valor Fixo / Preço
+        # Arredondamos para CIMA para garantir que o total seja >= $1.00 (mínimo da Polymarket)
+        import math
+        size = FIXED_TRADE_AMOUNT / price
+        size = math.ceil(size * 100) / 100  # Arredonda para cima com 2 casas decimais
+        
+        if size <= 0:
+            print("❌ Tamanho da ordem calculado é 0.")
+            return
+
+        outcome_str = f" ({outcome})" if outcome else ""
+        print(f"🤖 Preparando Trade: {side} {size} shares de '{title}'{outcome_str} @ {price} (Total: ${size*price:.2f})")
+        
+        if DRY_RUN:
+            print("🚧 DRY RUN: Ordem não enviada.")
+            return
+
+        # 3. Envia Ordem (FOK - Fill Or Kill para garantir execução imediata ou nada)
+        # Precisamos do Token ID? O asset_id do Data API geralmente é o Token ID.
+        # Data API 'asset' field = Token ID (geralmente um hash longo)
+        
+        order_args = OrderArgs(
+            price=price,
+            size=size,
+            side=side.upper(),
+            token_id=asset_id
+        )
+        
+        # Assina e envia
+        # Nota: A versão atual da lib usa GTC por padrão e FOK não parece estar exposto diretamente no OrderArgs simples.
+        # Para FOK, precisaríamos usar opções avançadas ou outra chamada.
+        # Por enquanto, vamos de GTC (Good Till Cancelled) que é o padrão.
+        resp = client.create_and_post_order(order_args)
+        print(f"✅ Ordem Enviada! ID: {resp.get('orderID')}")
+        send_telegram_message(f"🤖 *COPY TRADE EXECUTADO*\n{side} {size} de {title}\nOutcome: {outcome or 'N/A'}\nPreço: {price}")
+        
+    except PolyApiException as e:
+        if e.status_code == 404:
+            print(f"⚠️ Orderbook não encontrado para {title} (Mercado fechado/resolvido?)")
+        else:
+            print(f"❌ Erro API Polymarket: {e}")
+            send_telegram_message(f"❌ *ERRO API POLYMARKET*\n{str(e)}")
+            
+    except Exception as e:
+        print(f"❌ Erro ao executar trade: {e}")
+        send_telegram_message(f"❌ *ERRO NO COPY TRADE*\n{str(e)}")
 
 # Arquivo para salvar estado das posições
 POSITIONS_FILE = 'last_positions.json'
@@ -136,6 +299,9 @@ def main():
         print("TARGET_WALLET not set in .env")
         return
 
+    # Inicializa cliente de trading
+    clob_client = init_clob_client()
+
     # 1. Busca posições atuais na API
     current_positions_list = get_positions()
     print(f"Encontradas {len(current_positions_list)} posições ativas")
@@ -167,6 +333,11 @@ def main():
             print(f"Nova posição encontrada: {pos.get('title')}")
             msg = format_position_update(pos, 'NEW')
             if msg: send_telegram_message(msg)
+            
+            # COPY TRADE
+            if clob_client:
+                execute_trade(clob_client, asset, "BUY", pos.get('title'), pos.get('outcome'))
+                
             changes_detected = True
             
         else:
@@ -179,6 +350,11 @@ def main():
                 print(f"Aumento de posição: {pos.get('title')}")
                 msg = format_position_update(pos, 'INCREASE', diff)
                 if msg: send_telegram_message(msg)
+                
+                # COPY TRADE
+                if clob_client:
+                    execute_trade(clob_client, asset, "BUY", pos.get('title'), pos.get('outcome'))
+                    
                 changes_detected = True
             elif diff < -0.1:
                 print(f"Redução de posição: {pos.get('title')}")
